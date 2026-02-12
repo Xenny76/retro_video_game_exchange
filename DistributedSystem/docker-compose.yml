@@ -18,6 +18,39 @@ services:
       - ./Retro-Video-Game-Exchange-RMM3-API-/.env
     ports:
       - "8000"
+    depends_on:
+      - kafka
+    networks:
+      - distributed_system
+
+  kafka:
+    image: confluentinc/cp-kafka:8.1.1
+    hostname: kafka
+    container_name: kafka
+    ports:
+      - "9092:9092"     # host access (localhost:9092)
+    environment:
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:29093"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT"
+      KAFKA_LISTENERS: "PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    networks:
+      - distributed_system
+
+  notifier:
+    build:
+      context: ./notifier
+      dockerfile: Dockerfile
+    env_file:
+      - ./notifier/.env
+    depends_on:
+      - kafka
     networks:
       - distributed_system
 

@@ -1,0 +1,107 @@
+import json
+import os
+import time
+from email.message import EmailMessage
+import smtplib
+from confluent_kafka import Consumer
+
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+
+TOPIC_PREFIX = os.getenv("KAFKA_TOPIC_PREFIX", "notifications").strip()
+KAFKA_TOPICS = os.getenv(
+    "KAFKA_TOPICS",
+    f"{TOPIC_PREFIX}.users,{TOPIC_PREFIX}.games,{TOPIC_PREFIX}.offers"
+)
+
+TOPICS = [t.strip() for t in KAFKA_TOPICS.split(",") if t.strip()]
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.ethereal.email")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "retro-exchange@example.test")
+
+def send_email(to_email: str, subject: str, body: str):
+    msg = EmailMessage()
+    msg["From"] = SMTP_FROM
+    msg["To"] = to_email
+    msg["Subject"] = subject
+    msg.set_content(body)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.send_message(msg)
+
+def subject_for(event_type: str) -> str:
+    return {
+        "password_changed": "Your password was changed",
+        "offer_created": "New trade offer created",
+        "offer_accepted": "Trade offer accepted",
+        "offer_rejected": "Trade offer rejected",
+    }.get(event_type, f"Notification: {event_type}")
+
+def body_for(evt: dict) -> str:
+    et = evt.get("event_type")
+    data = evt.get("data", {})
+    links = evt.get("links", {})
+
+    lines = [f"Event: {et}", f"When: {evt.get('occurred_at')}", ""]
+    if et == "password_changed":
+        lines += ["Your password was changed.", "If this wasn't you, contact support immediately.", ""]
+
+    if et in ("offer_created", "offer_accepted", "offer_rejected"):
+        lines += [
+            f"Offer ID: {data.get('offer_id')}",
+            f"Status: {data.get('status')}",
+            f"Requested game: {data.get('requested_game_name')} ({data.get('requested_game_id')})",
+            f"Offered game:   {data.get('offered_game_name')} ({data.get('offered_game_id')})",
+        ]
+        reason = data.get("reason")
+        if reason:
+            lines.append(f"Reason: {reason}")
+        lines.append("")
+
+    if links.get("offer"):
+        lines.append(f"Offer link: {links['offer']}")
+    if links.get("requested_game"):
+        lines.append(f"Requested game link: {links['requested_game']}")
+    if links.get("offered_game"):
+        lines.append(f"Offered game link: {links['offered_game']}")
+
+    return "\n".join(lines)
+
+def main():
+    consumer = Consumer(
+        {
+            "bootstrap.servers": KAFKA_BOOTSTRAP,
+            "group.id": "retro-notifier",
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": True,
+        }
+    )
+    consumer.subscribe(TOPICS)
+    print(f"[notifier] listening topics={TOPICS} bootstrap={KAFKA_BOOTSTRAP}")
+
+    try:
+        while True:
+            msg = consumer.poll(1.0)
+            if msg is None:
+                continue
+            if msg.error():
+                print("[notifier] kafka error:", msg.error())
+                continue
+
+            evt = json.loads(msg.value().decode("utf-8"))
+            subj = subject_for(evt.get("event_type", "notification"))
+            body = body_for(evt)
+
+            for r in evt.get("recipients", []):
+                send_email(r["email"], subj, body)
+                print(f"[notifier] sent {evt.get('event_type')} to {r['email']}")
+    finally:
+        consumer.close()
+
+if __name__ == "__main__":
+    time.sleep(2)
+    main()
