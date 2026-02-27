@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import time
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Optional, List
@@ -20,6 +22,7 @@ from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 from starlette.datastructures import URL
 from contextlib import asynccontextmanager
+from prometheus_fastapi_instrumentator import Instrumentator
 
 # Kafka producer (best-effort)
 from confluent_kafka import Producer
@@ -43,9 +46,9 @@ JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "120"))
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").strip()
-KAFKA_TOPIC_USERS = os.getenv("KAFKA_TOPIC_USERS", "notifications.users").strip()
-KAFKA_TOPIC_OFFERS = os.getenv("KAFKA_TOPIC_OFFERS", "notifications.offers").strip()
-KAFKA_TOPIC_GAMES = os.getenv("KAFKA_TOPIC_GAMES", "notifications.games").strip()
+KAFKA_TOPIC_USERS = os.getenv("KAFKA_TOPIC_USERS", "users").strip()
+KAFKA_TOPIC_OFFERS = os.getenv("KAFKA_TOPIC_OFFERS", "offers").strip()
+KAFKA_TOPIC_GAMES = os.getenv("KAFKA_TOPIC_GAMES", "games").strip()
 
 if not MONGO_URI:
     raise RuntimeError("Missing MONGO_URI. Put it in your .env file.")
@@ -111,6 +114,19 @@ app = FastAPI(
     version="1.2.0",
     description="Users register and list retro games for trade. Trades happen outside the API.",
     lifespan=lifespan,
+)
+
+
+# Prometheus instrumentation (for Grafana dashboard 22676)
+instrumentator = Instrumentator(
+    should_ignore_untemplated=True,
+    excluded_handlers=["/metrics"],
+)
+instrumentator.instrument(app).expose(
+    app,
+    endpoint="/metrics",
+    include_in_schema=False,
+    should_gzip=True,
 )
 
 

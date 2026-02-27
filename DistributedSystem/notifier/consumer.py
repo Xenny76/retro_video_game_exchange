@@ -4,15 +4,12 @@ import time
 from email.message import EmailMessage
 import smtplib
 from confluent_kafka import Consumer
+from prometheus_client import Counter, Histogram, start_http_server
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 
-TOPIC_PREFIX = os.getenv("KAFKA_TOPIC_PREFIX", "notifications").strip()
-KAFKA_TOPICS = os.getenv(
-    "KAFKA_TOPICS",
-    f"{TOPIC_PREFIX}.users,{TOPIC_PREFIX}.games,{TOPIC_PREFIX}.offers"
-)
-
+# Plain topic names
+KAFKA_TOPICS = os.getenv("KAFKA_TOPICS", "users,games,offers")
 TOPICS = [t.strip() for t in KAFKA_TOPICS.split(",") if t.strip()]
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.ethereal.email")
@@ -21,17 +18,57 @@ SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 SMTP_FROM = os.getenv("SMTP_FROM", "retro-exchange@example.test")
 
-def send_email(to_email: str, subject: str, body: str):
-    msg = EmailMessage()
-    msg["From"] = SMTP_FROM
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.set_content(body)
+METRICS_PORT = int(os.getenv("METRICS_PORT", "8001"))
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
-        server.starttls()
-        server.login(SMTP_USER, SMTP_PASS)
-        server.send_message(msg)
+# ------------------------------------------------------------
+# Prometheus metrics
+# ------------------------------------------------------------
+notifier_kafka_messages_total = Counter(
+    "notifier_kafka_messages_total",
+    "Total Kafka messages consumed by the notifier",
+    ["topic", "event_type"],
+)
+
+notifier_emails_sent_total = Counter(
+    "notifier_emails_sent_total",
+    "Total emails successfully sent by the notifier",
+    ["event_type"],
+)
+
+notifier_email_failures_total = Counter(
+    "notifier_email_failures_total",
+    "Total email send failures in the notifier",
+    ["event_type"],
+)
+
+notifier_email_send_seconds = Histogram(
+    "notifier_email_send_seconds",
+    "Time spent sending email in seconds",
+    ["event_type"],
+)
+
+
+def send_email(to_email: str, subject: str, body: str, event_type: str):
+    start = time.time()
+    try:
+        msg = EmailMessage()
+        msg["From"] = SMTP_FROM
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.set_content(body)
+
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.send_message(msg)
+
+        notifier_emails_sent_total.labels(event_type=event_type).inc()
+    except Exception:
+        notifier_email_failures_total.labels(event_type=event_type).inc()
+        raise
+    finally:
+        notifier_email_send_seconds.labels(event_type=event_type).observe(time.time() - start)
+
 
 def subject_for(event_type: str) -> str:
     return {
@@ -41,14 +78,20 @@ def subject_for(event_type: str) -> str:
         "offer_rejected": "Trade offer rejected",
     }.get(event_type, f"Notification: {event_type}")
 
+
 def body_for(evt: dict) -> str:
     et = evt.get("event_type")
     data = evt.get("data", {})
     links = evt.get("links", {})
 
     lines = [f"Event: {et}", f"When: {evt.get('occurred_at')}", ""]
+
     if et == "password_changed":
-        lines += ["Your password was changed.", "If this wasn't you, contact support immediately.", ""]
+        lines += [
+            "Your password was changed.",
+            "If this wasn't you, contact support immediately.",
+            "",
+        ]
 
     if et in ("offer_created", "offer_accepted", "offer_rejected"):
         lines += [
@@ -71,7 +114,12 @@ def body_for(evt: dict) -> str:
 
     return "\n".join(lines)
 
+
 def main():
+    # Starts a tiny HTTP server that serves /metrics
+    start_http_server(METRICS_PORT, addr="0.0.0.0")
+    print(f"[notifier] metrics available on :{METRICS_PORT}/metrics")
+
     consumer = Consumer(
         {
             "bootstrap.servers": KAFKA_BOOTSTRAP,
@@ -88,22 +136,41 @@ def main():
             msg = consumer.poll(1.0)
             if msg is None:
                 continue
+
             if msg.error():
                 print("[notifier] kafka error:", msg.error())
                 continue
 
-            evt = json.loads(msg.value().decode("utf-8"))
-            subj = subject_for(evt.get("event_type", "notification"))
+            topic = msg.topic() or "unknown"
+
+            try:
+                evt = json.loads(msg.value().decode("utf-8"))
+            except Exception as e:
+                print(f"[notifier] bad json payload on topic={topic}: {e}")
+                continue
+
+            event_type = evt.get("event_type", "notification")
+            notifier_kafka_messages_total.labels(topic=topic, event_type=event_type).inc()
+
+            subj = subject_for(event_type)
             body = body_for(evt)
 
             for r in evt.get("recipients", []):
-                send_email(r["email"], subj, body)
-                print(f"[notifier] sent {evt.get('event_type')} to {r['email']}")
+                email = r.get("email") if isinstance(r, dict) else None
+                if not email:
+                    continue
+
+                try:
+                    send_email(email, subj, body, event_type)
+                    print(f"[notifier] sent {event_type} to {email}")
+                except Exception as e:
+                    print(f"[notifier] email failed to {email}: {e}")
+
     finally:
         consumer.close()
+
 
 if __name__ == "__main__":
     time.sleep(2)
     main()
-    
-# This document was generated by ChatGPT
+#This document was generated by ChatGPT
