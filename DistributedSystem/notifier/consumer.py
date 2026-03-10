@@ -8,7 +8,6 @@ from prometheus_client import Counter, Histogram, start_http_server
 
 KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 
-# Plain topic names
 KAFKA_TOPICS = os.getenv("KAFKA_TOPICS", "users,games,offers")
 TOPICS = [t.strip() for t in KAFKA_TOPICS.split(",") if t.strip()]
 
@@ -20,9 +19,6 @@ SMTP_FROM = os.getenv("SMTP_FROM", "retro-exchange@example.test")
 
 METRICS_PORT = int(os.getenv("METRICS_PORT", "8001"))
 
-# ------------------------------------------------------------
-# Prometheus metrics
-# ------------------------------------------------------------
 notifier_kafka_messages_total = Counter(
     "notifier_kafka_messages_total",
     "Total Kafka messages consumed by the notifier",
@@ -46,6 +42,11 @@ notifier_email_send_seconds = Histogram(
     "Time spent sending email in seconds",
     ["event_type"],
 )
+
+
+def log_json(stage: str, **fields):
+    # One JSON object per line -> Loki json parsing is happy
+    print(json.dumps({"service": "notifier", "stage": stage, **fields}), flush=True)
 
 
 def send_email(to_email: str, subject: str, body: str, event_type: str):
@@ -81,10 +82,16 @@ def subject_for(event_type: str) -> str:
 
 def body_for(evt: dict) -> str:
     et = evt.get("event_type")
+    request_id = evt.get("request_id")
     data = evt.get("data", {})
     links = evt.get("links", {})
 
-    lines = [f"Event: {et}", f"When: {evt.get('occurred_at')}", ""]
+    lines = [
+        f"Request ID: {request_id}",
+        f"Event: {et}",
+        f"When: {evt.get('occurred_at')}",
+        "",
+    ]
 
     if et == "password_changed":
         lines += [
@@ -116,9 +123,8 @@ def body_for(evt: dict) -> str:
 
 
 def main():
-    # Starts a tiny HTTP server that serves /metrics
     start_http_server(METRICS_PORT, addr="0.0.0.0")
-    print(f"[notifier] metrics available on :{METRICS_PORT}/metrics")
+    log_json("startup", metrics_port=METRICS_PORT, topics=TOPICS, bootstrap=KAFKA_BOOTSTRAP)
 
     consumer = Consumer(
         {
@@ -129,7 +135,6 @@ def main():
         }
     )
     consumer.subscribe(TOPICS)
-    print(f"[notifier] listening topics={TOPICS} bootstrap={KAFKA_BOOTSTRAP}")
 
     try:
         while True:
@@ -138,7 +143,7 @@ def main():
                 continue
 
             if msg.error():
-                print("[notifier] kafka error:", msg.error())
+                log_json("kafka_error", error=str(msg.error()))
                 continue
 
             topic = msg.topic() or "unknown"
@@ -146,11 +151,15 @@ def main():
             try:
                 evt = json.loads(msg.value().decode("utf-8"))
             except Exception as e:
-                print(f"[notifier] bad json payload on topic={topic}: {e}")
+                log_json("bad_json", topic=topic, error=str(e))
                 continue
 
+            request_id = evt.get("request_id")
             event_type = evt.get("event_type", "notification")
+
             notifier_kafka_messages_total.labels(topic=topic, event_type=event_type).inc()
+
+            log_json("recv", topic=topic, event_type=event_type, request_id=request_id)
 
             subj = subject_for(event_type)
             body = body_for(evt)
@@ -162,9 +171,9 @@ def main():
 
                 try:
                     send_email(email, subj, body, event_type)
-                    print(f"[notifier] sent {event_type} to {email}")
+                    log_json("sent", event_type=event_type, to=email, request_id=request_id)
                 except Exception as e:
-                    print(f"[notifier] email failed to {email}: {e}")
+                    log_json("send_failed", event_type=event_type, to=email, request_id=request_id, error=str(e))
 
     finally:
         consumer.close()

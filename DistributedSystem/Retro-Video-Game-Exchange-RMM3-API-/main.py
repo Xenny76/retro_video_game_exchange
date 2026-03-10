@@ -23,6 +23,8 @@ from pymongo.server_api import ServerApi
 from starlette.datastructures import URL
 from contextlib import asynccontextmanager
 from prometheus_fastapi_instrumentator import Instrumentator
+import uuid, json, logging, time
+from fastapi import Request
 
 # Kafka producer (best-effort)
 from confluent_kafka import Producer
@@ -115,6 +117,35 @@ app = FastAPI(
     description="Users register and list retro games for trade. Trades happen outside the API.",
     lifespan=lifespan,
 )
+
+logger = logging.getLogger("retro_api")
+logger.setLevel(logging.INFO)
+
+# Make log output be ONLY the JSON message (no "INFO:retro_api:" prefix)
+logger.propagate = False
+logger.handlers.clear()
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("%(message)s"))
+logger.addHandler(_handler)
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    rid = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = rid
+
+    start = time.time()
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = rid
+
+    logger.info(json.dumps({
+        "service": "retro_api",
+        "request_id": rid,
+        "method": request.method,
+        "path": request.url.path,
+        "status_code": response.status_code,
+        "duration_ms": int((time.time() - start) * 1000),
+    }))
+    return response
 
 
 # Prometheus instrumentation (for Grafana dashboard 22676)
@@ -258,6 +289,8 @@ def _notify_password_changed(request: Request, current_user: dict[str, Any]) -> 
         "data": {"user_id": str(current_user["_id"])},
         "links": {"user": url_for(request, "get_user_self")},
     }
+    request_id = getattr(request.state, "request_id", None)
+    payload["request_id"] = request_id
     _produce_kafka(request, KAFKA_TOPIC_USERS, payload, key=str(current_user["_id"]))
 
 
@@ -297,7 +330,8 @@ def _notify_offer_event(
             "offered_game": url_for(request, "get_game", game_id=str(offered_game_id)),
         },
     }
-
+    request_id = getattr(request.state, "request_id", None)
+    payload["request_id"] = request_id
     _produce_kafka(request, KAFKA_TOPIC_OFFERS, payload, key=offer_id)
 
 
